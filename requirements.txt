@@ -1,0 +1,4 @@
+pymupdf==1.28.0
+pillow==12.3.0
+pytesseract==0.3.13
+rapidfuzz==3.14.5
