@@ -15,4 +15,11 @@ docker run --rm --network none \
   mib-submission /input /output/predictions.jsonl
 ```
 
-Runtime: Tesseract + PyMuPDF + RapidFuzz. CPU-only, no network, no LLM/VLM.
+Runtime: CPU only, offline, no LLM or VLM. Four dependencies, each load-bearing:
+
+- PyMuPDF reads the native text layer with span styling (which is how hidden/injected text gets dropped) and rasterizes pages
+- pytesseract/Tesseract OCRs the roughly 30% of pages that are image-only
+- Pillow does the grayscale and binarization preprocessing in between
+- RapidFuzz snaps OCR-noisy values onto the closed field vocabularies
+
+Local run (needs `tesseract` on PATH): `pip install -r requirements.txt && python mib.py <pdf_dir> <out.jsonl>`
