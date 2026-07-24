@@ -205,6 +205,31 @@ def ocr_page_hard(page: fitz.Page) -> list[list[str]]:
     return _cached(f"{_page_key(page)}-hard", compute)
 
 
+ROT_CUE = re.compile(r"observed|flags|species\s*match|biometric", re.I)
+
+
+def ocr_rot_quick(page: fitz.Page) -> list[str]:
+    """Cheap 150-DPI 90/270 probe: does this stuck page hide a sideways slip?"""
+    def compute():
+        pix = page.get_pixmap(dpi=150, colorspace=fitz.csGRAY)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return [" ".join(_tsv_lines(img.rotate(rot, expand=True), 11)) for rot in (90, 270)]
+    return _cached(f"{_page_key(page)}-rotq", compute)
+
+
+def ocr_rot_full(page: fitz.Page) -> list[list[str]]:
+    """Full rotated read for a cue-confirmed sideways slip."""
+    def compute():
+        pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        variants = []
+        for rot in (90, 270):
+            r = img.rotate(rot, expand=True)
+            variants += [_tsv_lines(r, 6), _tsv_lines(r, 11)]
+        return variants
+    return _cached(f"{_page_key(page)}-rotf", compute)
+
+
 def detect_doctype(lines: list[str]) -> str | None:
     """Fuzzy-match a page's head lines against the known form titles; None below cutoff."""
     joined = " ".join(lines[:8])
@@ -269,6 +294,8 @@ def scan_flags(low: str) -> set[str]:
         hit = rf_process.extractOne(tok.replace(" ", "_"), FLAGS, scorer=fuzz.ratio, score_cutoff=82)
         if hit:
             found.add(hit[0])
+    if "rescind" in low and "deni" in low:  # prose form ("prior denial stamp rescinded"), 21/21 on train
+        found.add("rescinded_denial")
     return found
 
 
@@ -434,6 +461,137 @@ def normalize_field(field: str, raw: str | None, is_ocr: bool) -> str | None:
     return raw
 
 
+# --- output-only scavenge for empty (mode-prior) vocab fields ------------------
+# Each field: (label-tail WRatio cutoff, whole-text partial_ratio cutoff, tie margin).
+# Fire on any label or whole hit; pick the vocab value with most votes, then best
+# score; a vote-tie needs the margin. Configs tuned on train empties: net-positive,
+# >=10 support, non-negative in all 5 stride-5 folds.
+SCAV_CFG = {
+    "species_code": (SPECIES, [r"species\s*code", r"species\s*match", r"pecies\s*code", r"species"], 72, 62, 0),
+    "home_world": (WORLDS, [r"home\s*wor[il]d", r"home\s*world"], 66, 66, 0),
+    "visa_class": (VISAS, [r"visa\s*class", r"visa"], 72, 80, 0),
+    "declared_purpose": (PURPOSES, [r"declared\s*purpose", r"purpose"], 66, 62, 6),
+}
+
+
+def _scav_case(cand: str, field: str) -> str:
+    if field == "species_code":
+        return cand.upper().replace(" ", "_")
+    if field == "visa_class":
+        return cand.upper().replace(" ", "")
+    if field == "declared_purpose":
+        return cand.lower()
+    return cand
+
+
+def scavenge_vocab(lines: list[str], field: str) -> str | None:
+    vocab, pats, cl, cw, mg = SCAV_CFG[field]
+    agg: dict[str, list[int]] = {}  # val -> [n_label, best_label, n_whole, best_whole]
+    for ln in lines:
+        low = ln.lower()
+        for pat in pats:
+            m = re.search(pat, low)
+            if m:
+                tail = re.split(r"[|]", ln[m.end():])[0].strip(" :.;-_")
+                if tail:
+                    h = rf_process.extractOne(_scav_case(tail, field), vocab, scorer=fuzz.WRatio)
+                    if h and h[1] >= cl:
+                        a = agg.setdefault(h[0], [0, 0, 0, 0])
+                        a[0] += 1
+                        a[1] = max(a[1], int(h[1]))
+                break
+    blob = " ".join(lines).lower()
+    for v in vocab:
+        s = fuzz.partial_ratio(v.lower(), blob)
+        if s >= cw:
+            a = agg.setdefault(v, [0, 0, 0, 0])
+            a[2] += 1
+            a[3] = int(s)
+    if not agg:
+        return None
+    def strength(a):
+        return (a[0] + a[2], max(a[1], a[3]))
+    ranked = sorted(agg.items(), key=lambda kv: strength(kv[1]), reverse=True)
+    val, a = ranked[0]
+    if len(ranked) > 1:
+        (tv, bs), (tv2, bs2) = strength(a), strength(ranked[1][1])
+        if tv == tv2 and bs - bs2 < mg:
+            return None
+    return val
+
+
+def scavenge_name(lines: list[str]) -> str | None:
+    """2-vocab-token pair: adjacent tokens both snapping to NAME_VOCAB. Empty names
+    have no mode prior, so a wrong hit is a no-op (miss stays miss) — pure upside."""
+    best = None
+    for ln in lines:
+        toks = [t for t in re.split(r"[^A-Za-z]+", ln) if len(t) >= 3 and t.lower() not in NAME_LABELS]
+        for a, b in zip(toks, toks[1:]):
+            ha = rf_process.extractOne(a, NAME_VOCAB, scorer=fuzz.WRatio, score_cutoff=66)
+            hb = rf_process.extractOne(b, NAME_VOCAB, scorer=fuzz.WRatio, score_cutoff=66)
+            if ha and hb:
+                sc = ha[1] + hb[1]
+                if best is None or sc > best[0]:
+                    best = (sc, f"{ha[0]} {hb[0]}")
+    return best[1] if best else None
+
+
+_SPN_ANCHOR = re.compile(r"(?:S[Pp0][Nn]|spo?ns?or|msi|sp[nm])", re.I)
+_G4 = re.compile(r"[0-9OoIlSsBbgGQqZzEe]{4}")
+_YEARS = {"2024", "2025", "2026", "2027"}
+
+
+def scavenge_sponsor(blob: str) -> str | None:
+    """OCR-garbled sponsor id ('msi 5809' for SPN-5809): 4-digit-ish group near a
+    fuzzy SPN/sponsor anchor, digit-repaired, frequency-then-proximity vote."""
+    votes: dict[str, list[int]] = {}
+    for am in _SPN_ANCHOR.finditer(blob):
+        for gm in _G4.finditer(blob[am.end():am.end() + 12]):
+            fx = gm.group(0).translate(DIGIT_FIX)
+            if fx.isdigit() and fx not in _YEARS:
+                votes.setdefault(fx, []).append(gm.start())
+    if not votes:
+        return None
+    best = max(votes, key=lambda d: (len(votes[d]), -min(votes[d])))
+    return f"SPN-{best}"
+
+
+def scavenge_arrival(blob: str) -> str | None:
+    """Most-common in-window date after OCR digit repair; corpus arrivals are 2025-26."""
+    votes: dict[str, int] = {}
+    for mm in DATE_RE.finditer(blob.translate(DIGIT_FIX)):
+        y, mo, d = mm.group(1), mm.group(2), mm.group(3)
+        if y not in ("2025", "2026"):
+            continue
+        try:
+            iso = date(int(y), int(mo), int(d)).isoformat()
+        except ValueError:
+            continue
+        votes[iso] = votes.get(iso, 0) + 1
+    return max(votes, key=lambda k: votes[k]) if votes else None
+
+
+def resolve_name_candidates(cands: list) -> list:
+    """Pick the applicant_name candidate to trust. The plain (rank,tier) sort lets a
+    lower-ranked partial ('Qorvoss') or a doubled-token OCR artifact ('Veedane Veedane')
+    outrank the complete name that sits on a higher-ranked but OCR'd source. Prefer a
+    canonical 2-vocab-token name; only fall back to raw rank order when none exists."""
+    if not cands:
+        return cands
+    def toks(v):
+        return str(v).split()
+    def doubled(v):
+        t = toks(v)
+        return len(t) == 2 and t[0].lower() == t[1].lower()
+    def clean_full(v):
+        t = toks(v)
+        return len(t) == 2 and all(
+            rf_process.extractOne(w, NAME_VOCAB, scorer=fuzz.WRatio, score_cutoff=72) for w in t)
+    usable = [c for c in cands if not doubled(c[1])] or cands
+    clean = [c for c in usable if clean_full(c[1])]
+    return sorted(clean or usable, key=lambda c: c[0])
+
+
 def extract_case(pdf_path: str) -> Record:
     """One packet PDF -> prediction record: read (or OCR) each page, classify its
     doctype, accumulate field candidates by (source, tier), resolve, adjudicate."""
@@ -449,6 +607,10 @@ def extract_case(pdf_path: str) -> Record:
     untyped_ocr_pages = 0    # unidentified OCR pages — any could be the flags slip
     ocr_pages_seen = 0       # any image-only page at all — flags may hide in unread imagery
     receipt_cues = {}
+    rot_budget = 4           # rotation probes per PDF, bounds worst-case wall-clock
+    scav_lines = []          # every line seen (native + all OCR variants), for the
+                             # post-adjudication output-only scavenge pass
+    rot_lines = []           # rotated-read text, scavenged for sponsor/arrival only
 
     for page in list(doc)[:12]:  # corpus packets are <=6pp; cap runaway OCR on a huge private PDF
         try:
@@ -472,15 +634,18 @@ def extract_case(pdf_path: str) -> Record:
         def process_variants(vlist):
             nonlocal doctype
             for vlines in vlist:
+                scav_lines.extend(vlines)
                 dt = detect_doctype(vlines)
                 if dt and doctype is None:
                     doctype = dt
                 dt = dt or doctype
                 text = " ".join(vlines)
+                # strict Finding: lines count on ANY page type — a note whose damaged
+                # title misclassifies as intake still carries its legible finding
                 f = parse_note(vlines)
                 if not f and dt == "note":
                     f = parse_note_fuzzy(vlines)
-                if f and (dt == "note" or not is_ocr):
+                if f:
                     findings.append(f)
                 if is_ocr and not f and dt:
                     for ln in vlines:
@@ -548,6 +713,26 @@ def extract_case(pdf_path: str) -> Record:
                     process_variants(ocr_page_hard(page))
                 except Exception:
                     pass
+        if is_ocr and rot_budget > 0 and "risk_flags" not in page_found and doctype in (None, "biometric"):
+            rot_budget -= 1
+            # Rotated slips defeat Tesseract's OSD under background noise; brute
+            # 90/270 read, POSITIVE tokens only. A recovered "none" must not kill
+            # the flags_uncertain hedge — on train "none" wasn't load-bearing, the
+            # hedge was (accepting it created a new catastrophic false approval).
+            try:
+                rq = ocr_rot_quick(page)
+                rot_lines.extend(rq)
+                if any(ROT_CUE.search(t) for t in rq):
+                    pos = set()
+                    for rv in ocr_rot_full(page):
+                        rot_lines.extend(rv)
+                        pos |= scan_flags(" ".join(rv).lower())
+                    pos.discard("none")
+                    if pos:
+                        candidates.setdefault("risk_flags", []).append(
+                            ((SOURCE_RANK["biometric"] + 10, 1), "|".join(sorted(pos))))
+            except Exception:
+                pass
         if doctype is not None:
             stamps_all.extend(stamps)  # trust a big-font stamp only on a recognized page
         if doctype == "biometric":
@@ -565,9 +750,26 @@ def extract_case(pdf_path: str) -> Record:
     tiers = {}
     for field in ("applicant_name", "species_code", "home_world", "visa_class",
                   "sponsor_id", "arrival_date", "declared_purpose", "risk_flags", "fee_status"):
-        cands = sorted(candidates.get(field, []), key=lambda c: c[0])
+        cands = candidates.get(field, [])
+        if field == "applicant_name":
+            cands = resolve_name_candidates(cands)
+        else:
+            cands = sorted(cands, key=lambda c: c[0])
         record[field] = cands[0][1] if cands else None
         tiers[field] = cands[0][0][1] if cands else 3
+
+    # risk_flags is set-valued (scored as set equality), so first-candidate-wins is
+    # wrong for it: a note's reason sentence names only the disqualifying flag and
+    # outranks the slip's complete "Observed flags" set. Union all candidates instead.
+    rf_cands = candidates.get("risk_flags", [])
+    if rf_cands:
+        union = {tok.strip() for _prio, val in rf_cands for tok in str(val).split("|")
+                 if tok.strip() and tok.strip() != "none"}
+        record["risk_flags"] = "|".join(sorted(union)) if union else "none"
+
+    # A POSITIVELY-read "unknown" fee (truth=unknown 31/45 on train) must keep its
+    # value; only the no-evidence bucket (truth paid 248/354) takes the paid prior.
+    fee_no_evidence = not candidates.get("fee_status") and "amount" not in receipt_cues
 
     # Receipt Amount+Waiver pair is 100% predictive on train and overrides a
     # misprinted Fee Status word — don't "fix" this to prefer the status text.
@@ -580,7 +782,7 @@ def extract_case(pdf_path: str) -> Record:
         record["fee_status"] = "unpaid" if record["fee_status"] == "unpaid" else "unknown"
 
     flags_uncertain = not flags_readable and (slip_seen or untyped_ocr_pages > 0 or ocr_pages_seen > 0)
-    # embargo home world implies planetary_embargo (50/50 on train, incl. DIP-1)
+    # embargo home world implies planetary_embargo (46/49 on train, incl. DIP-1)
     if record["home_world"] in ("TRAPPIST-1e", "Eris Relay"):
         cur = set() if record["risk_flags"] in (None, "none") else set(record["risk_flags"].split("|"))
         cur.add("planetary_embargo")
@@ -604,8 +806,21 @@ def extract_case(pdf_path: str) -> Record:
     # No receipt evidence survives -> MAP prior: fee paid in 64% of such cases on
     # train (paid 259 / waived 94 / unknown 44 / unpaid 9 of 406). Applied AFTER
     # adjudicate so fee_unknown->REVIEW is unchanged; feeding "paid" in pushed CFA 15->19.
-    if record["fee_status"] == "unknown":
+    if record["fee_status"] == "unknown" and fee_no_evidence:
         record["fee_status"] = "paid"
+
+    # Output-only OCR scavenge: mine every line seen for still-empty vocab fields
+    # with looser label/whole-text voting. AFTER adjudicate, so decisions never
+    # move; beats the blanket mode prior (+204 weighted raw, 5/5 folds >= 0).
+    for fld in SCAV_CFG:
+        if not record.get(fld):
+            record[fld] = scavenge_vocab(scav_lines, fld)
+    if not record.get("applicant_name"):
+        record["applicant_name"] = scavenge_name(scav_lines)
+    if not record.get("sponsor_id"):
+        record["sponsor_id"] = scavenge_sponsor(" ".join(scav_lines + rot_lines))
+    if record.get("arrival_date") in (None, "", "UNRECOVERABLE"):
+        record["arrival_date"] = scavenge_arrival(" ".join(scav_lines + rot_lines)) or record.get("arrival_date")
 
     # MAP prior for still-empty categoricals, AFTER adjudicate so decisions are
     # untouched. An empty pred is a guaranteed exact-match miss, so the train mode
@@ -634,7 +849,7 @@ def adjudicate(rec: Record, findings: list[str], stamps: list[str],
     APPROVED. A deny rule on an OCR-derived value requires trusted tier (<=1)."""
     tiers = tiers or {}
     flags = set(rec["risk_flags"].split("|")) if rec["risk_flags"] not in ("none", None) else set()
-    # manual note matched truth 304/304 on train (incl. fuzzy-recovered); a lone stamp is 100%,
+    # manual note matched truth 320/320 on train (incl. fuzzy-recovered); a lone stamp is 100%,
     # conflicting stamps always meant NEEDS_REVIEW (9/9)
     if len(set(findings)) == 1:
         return findings[0], "manual_note"
@@ -662,6 +877,12 @@ def adjudicate(rec: Record, findings: list[str], stamps: list[str],
         y, m, d = map(int, rec["arrival_date"].split("-"))
         if date(y, m, d) < STALE_BEFORE and tiers.get("arrival_date", 3) <= 1:
             return "DENIED", "stale"
+    # junk packet: world, sponsor, and flags all unrecovered plus an unreadable
+    # OCR page — deny rather than hedge (13/17 on train, positive in 5/5 held-out
+    # folds; deny-direction only, so it can never create a false approval).
+    # Predicate matches strobl's three-required-outputs-unknown head (MIT).
+    if rec["home_world"] is None and rec["sponsor_id"] is None and evsig[1] == "0" and evsig[2] == "1":
+        return "DENIED", "junk_deny"
     if rec["arrival_date"] in (None, "", "UNRECOVERABLE"):
         # sig 101 (slip seen, flags unread, untyped OCR pages) is 71% DENIED / 0% REVIEW
         # on train — the only evidence-signature flip that survives 5/5 held-out.
@@ -682,7 +903,7 @@ def adjudicate(rec: Record, findings: list[str], stamps: list[str],
 CONFIDENCE = {
     "manual_note": 0.998, "stamp": 0.85, "stamp_conflict": 0.9,
     "disq_flag": 0.96, "transit": 0.89, "unpaid": 0.91, "revoked_sponsor": 0.94,
-    "wolf": 0.81, "stale": 0.91, "review_flag": 0.92,
+    "wolf": 0.81, "stale": 0.91, "review_flag": 0.92, "junk_deny": 0.75,
     "default|000": 0.62, "default|110": 0.87, "default|111": 0.9, "default|011": 0.72,
     "fee_unknown|000": 0.51, "fee_unknown|001": 0.48, "fee_unknown|110": 0.6,
     "fee_unknown|111": 0.48, "fee_unknown|011": 0.83, "fee_unknown|100": 0.6,
